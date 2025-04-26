@@ -1,0 +1,158 @@
+import numpy as np
+
+from mappings import rnd_S, center, S_to_fg, S_to_R, is_in_bimapping_polytope
+from fw import make_frank_wolfe_solver
+from spaces import diam, rad, arrange_distances
+from constants import DEFAULT_SEED, C_SEARCH_GRID
+
+
+def dis(S, X, Y):
+    """
+    Calculates "distortion" of a soft mapping pair, which coincides with actual
+    distortion on the space of mapping pairs/correspondences.
+
+    :param S: soft mapping pair S ∈ 𝓢  (2d-array)
+    :param X: distance matrix of X (2d-array)
+    :param Y: distance matrix of Y (2d-array)
+    :return: distortion (float)
+    """
+    X__Y, Y__X, _Y_X = arrange_distances(X, Y)
+    S_Y_X = S @ _Y_X
+
+    dis_S = np.abs(X__Y - S @ Y__X @ S.T + S_Y_X - S_Y_X.T).max()
+
+    return dis_S
+
+
+def upper(X, Y, c='auto', iter_budget=100, S0=None, tol=1e-16, return_fg=False,
+          lb=0, validate_tri_ineq=False, verbose=0, rnd=None, find = False):
+    """
+    Finds am upper bound of dGH(X, Y) by minimizing smoothed dis(R) = dis(f, g)
+    over the bi-mapping polytope 𝓢 using Frank-Wolfe algorithm.
+
+    :param X: distance matrix of X (2d-array)
+    :param Y: distance matrix of Y (2d-array)
+    :param c: exponentiation base ∈ (1, ∞) for smoothing the distortion
+        in the first minimization problem (float)
+    :param iter_budget: total number of Frank-Wolfe iterations (int)
+    :param S0: first starting point (subsequent restarts always use random ones):
+        2d-array, 'center' for the center of 𝓢, None for random point in 𝓢
+    :param tol: tolerance to use when evaluating convergence (float)
+    :param return_fg: whether to return the optimal pair of mappings (bool)
+    :param lb: lower bound of dGH(X, Y) to avoid redundant iterations (float)
+    :param validate_tri_ineq: whether to validate the triangle inequality (bool)
+    :param verbose: no output if 0, summary if >0, restarts if >1, iterations if >2
+    :param rnd: random number generator to use for restarts
+    :return: dGH(X, Y), f [optional], g [optional]
+    """
+    # Ensure positive iteration budget.
+    assert iter_budget > 0, 'insufficient iteration budget'
+
+    # Check that the distances satisfy the metric properties minus the triangle inequality.
+    assert (X >= 0).all() and (Y >= 0).all(), 'distance matrices have negative entries'
+    assert (np.diag(X) == 0).all() and (np.diag(Y) == 0).all(),\
+        'distance matrices have non-zeros on the main diagonal'
+    assert (X == X.T).all() and (Y == Y.T).all(), 'distance matrices are not symmetric'
+    if validate_tri_ineq:
+        assert validate_tri_ineq(X) and validate_tri_ineq(Y),\
+            'triangle inequality does not hold'
+
+    # Ensure existence of a positive distance.
+    diam_X, diam_Y = map(diam, [X, Y])
+    d_max = max(diam_X, diam_Y)
+    assert d_max > 0, 'at least one space must have a non-trivial distance'
+
+    # Initialize.
+    n, m = len(X), len(Y)
+    rnd = rnd or np.random.RandomState(DEFAULT_SEED)
+    best_dis_R = np.inf
+
+    # Update lower bound using the radius and diameter differences.
+    rad_X, rad_Y = map(rad, [X, Y])
+    lb = max(lb, abs(diam_X - diam_Y)/2, abs(rad_X - rad_Y)/2)
+
+    if verbose > 0:
+        print(f'iteration budget {iter_budget} | c={c} | dGH≥{lb}')
+
+    # Search for best c if not specified.
+    if c == 'auto':
+        # Allocate 50% of iteration budget for the search.
+        search_iter_budget_per_c = iter_budget // (2*len(C_SEARCH_GRID))
+        search_iter_budget = search_iter_budget_per_c * len(C_SEARCH_GRID)
+        iter_budget -= search_iter_budget
+
+        # Select c resulting in the smallest upper bound.
+        init_rnd_state = rnd.get_state()
+        for c_test in C_SEARCH_GRID:
+            rnd.set_state(init_rnd_state)
+            ub, f, g = upper(X, Y, c=c_test, iter_budget=search_iter_budget_per_c,
+                             S0=S0, tol=tol, return_fg=True, lb=lb, rnd=rnd, find = True)
+            if ub < best_dis_R/2:
+                c = c_test
+                rnd_state = rnd.get_state()
+                best_f, best_g = f, g
+                best_dis_R = 2*ub
+
+        # Set random number generator to after the search iterations.
+        rnd.set_state(rnd_state)
+
+        if verbose > 0:
+            print(f'spent {search_iter_budget} iterations to choose c={c}')
+
+    # Scale all distances to avoid overflow.
+    X, Y = map(lambda Z: Z.copy() / d_max, [X, Y])
+    lb /= d_max
+
+    # Find minima from new restarts until iteration budget is depleted.
+    restart_idx = 0
+    used_iter = 0
+    fw = make_frank_wolfe_solver(X, Y, c, tol=tol, verbose=verbose)
+    while iter_budget > 0:
+        # Initialize new restart.
+        if (find == False and S0 is not None):
+            print(iter_budget, used_iter,'S0',c)
+        if restart_idx > 0 or S0 is None:
+            S0 = rnd_S(n, m, rnd)
+        elif S0 == 'center':
+            S0 = center(n, m)
+        else:
+            assert isinstance(S0, np.ndarray), "S0 must be a 2d-array, 'center', or None"
+            assert S0.shape == (n + m, n + m), 'S0 must be (n+m)×(n+m)'
+            assert is_in_bimapping_polytope(S0), 'S0 must be in the bi-mapping polytope'
+
+        # Find new (approximate) solution.
+        S, used_iter = fw(S0=S0, max_iter=iter_budget)
+
+        # Update iteration budget.
+        iter_budget -= used_iter
+
+        # Project the solution to the set of correspondences and find the
+        # resulting distortion on the original scale.
+        R = S_to_R(S, n, m)
+        dis_R = dis(R, X, Y) * d_max
+
+        # Update the best distortion achieved from all restarts.
+        if dis_R < best_dis_R:
+            best_f, best_g = map(list, S_to_fg(S, n, m))
+            best_dis_R = dis_R
+
+        if verbose > 1:
+            fg_descr = f' | f={best_f}, g={best_g}' if return_fg else ''
+            print(f'finished restart {restart_idx} ({used_iter} iterations) | '
+                  f'½dis(R)={dis_R/2:.4f} | min ½dis(R)={best_dis_R/2:.4f}{fg_descr}')
+
+        restart_idx += 1
+
+        # Terminate if achieved lower bound.
+        if abs(best_dis_R - lb) <= 0.5:
+            print(R)
+            if (find == False):
+                print(iter_budget + used_iter, 'break',c)
+            break
+
+    if verbose > 0:
+        print(f'proved dGH≤{best_dis_R/2} after {restart_idx} restarts')
+
+    res = (best_dis_R/2, best_f, best_g) if return_fg else best_dis_R/2
+
+    return res
